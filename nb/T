@@ -1,1 +1,60 @@
+# ------------------------------------------------------------------
+# Pretty-print the whole workflow run
+# ------------------------------------------------------------------
+from datetime import datetime
+import json
 
+def pretty_print_workflow(result: dict):
+    """
+    Nicely formatted report of the fraud-detection workflow.
+    """
+    print("# 🔍 Fraud-Detection Workflow Report")
+    print(f"**Generated:** {datetime.now():%Y-%m-%d %H:%M:%S}\n")
+
+    print("## 📄 Transaction Under Review")
+    print("```json")
+    print(json.dumps(result["transaction"], indent=2, ensure_ascii=False))
+    print("```\n")
+
+    print("## 🛠️ Step-by-Step Trace")
+    for idx, msg in enumerate(result["messages"], 1):
+        role = msg.type.upper()
+        content = msg.content.strip()
+
+        if role == "HUMAN":
+            # Show only the first line of the human prompt to keep it concise
+            headline = content.splitlines()[0] if content else "Prompt"
+            print(f"### {idx}. 👤 *{role}*: {headline}")
+        elif role == "AI":
+            print(f"### {idx}. 🤖 *{role}*")
+            if "Final Decision:" in content:
+                print("> ✅ **FINAL DECISION REACHED**")
+            else:
+                print("> 🔄 **DECISION: continue gathering data**")
+            print()
+            print("```")
+            print(content)
+            print("```")
+        elif role == "TOOL":
+            # Extract which tool was executed
+            # (LangChain’s ToolMessage has .name attribute in newer versions,
+            #  fallback if not available)
+            tool_name = getattr(msg, "name", "unknown_tool")
+            print(f"### {idx}. 🔧 *Tool Executed*: `{tool_name}`")
+            print("```json")
+            print(json.dumps(msg.content, indent=2, ensure_ascii=False))
+            print("```")
+
+    print("\n## 📊 Context Summary")
+    for key, value in result["context"].items():
+        if key != "processed_data":
+            print(f"- **{key}**:")
+            print("  ```json")
+            print(json.dumps(value, indent=2, ensure_ascii=False))
+            print("  ```")
+
+    print("\n## 🏁 Final Verdict")
+    print(f"> **{result['final_verdict'].upper()}**")
+
+# --- Run the pretty printer ---
+pretty_print_workflow(result)
