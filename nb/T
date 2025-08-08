@@ -1,214 +1,49 @@
-# 2. LLM Decision Node – returns proper ToolMessages
-def llm_decision(state: FraudDetectionState) -> FraudDetectionState:
-    """LLM decides next step and may request tools using proper tool_calls."""
-    messages = state["messages"]
+from langchain_core.messages import HumanMessage, ToolMessage
+from langchain_community.chat_models import ChatOllama
+from langchain_core.tools import tool
+from langgraph.graph import StateGraph, END
+from typing import Annotated, Sequence
+import operator
 
-    # Build a tiny system prompt so the model knows the available tools
-    tool_desc = "\n".join(
-        f"- {t.name}: {t.description}" for t in tools
-    )
-    sys = (
-        "You are a fraud-detection analyst. "
-        "Decide whether to call tools or make a final verdict.\n"
-        f"Available tools:\n{tool_desc}\n"
-        'Reply with a tool call OR end with exactly: "Final Decision: <legitimate|suspicious|fraudulent>"'
-    )
-    prompt = [{"role": "system", "content": sys}] + [
-        {"role": m.type, "content": m.content} for m in messages
-    ]
-
-    # Ask the LLM
-    response = model_pipeline(
-        prompt,
-        max_new_tokens=256,
-        return_full_text=False,
-        temperature=0.1
-    )[0]["generated_text"].strip()
-
-    # Detect simple final decision
-    if response.startswith("Final Decision:"):
-        verdict = response.split(":", 1)[1].strip()
-        ai_msg = AIMessage(content=response)
-        return {
-            **state,
-            "messages": messages + [ai_msg],
-            "decision": "final_decision",
-            "current_step": "llm_decision"
-        }
-
-    # Otherwise treat the reply as a tool request
-    # Very small heuristic: first line is the tool, rest are JSON args
-    lines = response.splitlines()
-    tool_name = lines[0].strip()
-    if tool_name not in [t.name for t in tools]:
-        # fallback – ask again
-        ai_msg = AIMessage(content=response)
-        return {
-            **state,
-            "messages": messages + [ai_msg],
-            "decision": "continue",
-            "current_step": "llm_decision"
-        }
-
+# Define tools
+@tool
+def calculator(expression: str) -> str:
+    """Calculate mathematical expressions"""
     try:
-        tool_args = json.loads("\n".join(lines[1:]) or "{}")
-    except json.JSONDecodeError:
-        tool_args = {}
+        result = eval(expression)
+        return str(result)
+    except:
+        return "Error in calculation"
 
-    ai_msg = AIMessage(
-        content=response,
-        tool_calls=[{
-            "name": tool_name,
-            "args": tool_args,
-            "id": f"tool_call_{len(messages)}"
-        }]
-    )
+# Initialize model with tool support
+llm = ChatOllama(model="mistral")
+tools = [calculator]
+llm_with_tools = llm.bind_tools(tools)
 
-    return {
-        **state,
-        "messages": messages + [ai_msg],
-        "decision": "continue",
-        "current_step": "llm_decision"
-    }
+# Agent state
+class AgentState(TypedDict):
+    messages: Annotated[Sequence[BaseMessage], operator.add]
 
-
-# 3. Tool Execution Node – uses AIMessage.tool_calls
-def execute_tools(state: FraudDetectionState) -> FraudDetectionState:
-    """Execute the tool calls requested by the LLM and append ToolMessages."""
+# Agent node function
+def call_model(state: AgentState):
     messages = state["messages"]
-    last_ai = messages[-1]
-    context = state["context"]
+    response = llm_with_tools.invoke(messages)
+    
+    # Check if tools were called
+    if hasattr(response, 'tool_calls') and response.tool_calls:
+        return {"messages": [response]}
+    else:
+        return {"messages": [response]}
 
-    if not last_ai.tool_calls:
-        # Nothing to do – shouldn’t happen
-        return state
+# Tool node function
+def call_tools(state: AgentState):
+    messages = state["messages"]
+    # Execute tools based on the last message
+    # ... tool execution logic
+    pass
 
-    # Map name → function
-    tool_map = {t.name: t for t in tools}
-
-    new_msgs = []
-    for call in last_ai.tool_calls:
-        func = tool_map[call["name"]]
-        try:
-            result = func.invoke(call["args"])
-        except Exception as e:
-            result = {"error": str(e)}
-
-        new_msgs.append(
-            ToolMessage(
-                content=json.dumps(result, indent=2),
-                tool_call_id=call["id"],
-                name=call["name"]
-            )
-        )
-
-        # Update context exactly like before
-        if call["name"] == "check_blacklist":
-            context["blacklist_results"] = result
-        elif call["name"] == "get_transaction_history":
-            context["transaction_history"] = result
-        elif call["name"] == "geolocation_verify":
-            context["geolocation_results"] = result
-        elif call["name"] == "identity_verification":
-            context["identity_results"] = result
-        elif call["name"] == "calculate_risk_score":
-            context["risk_score"] = result
-
-    follow_up = HumanMessage(
-        content="Tool results have been added to the context. "
-        "Please continue or issue a final decision."
-    )
-
-    return {
-        **state,
-        "context": context,
-        "messages": messages + new_msgs + [follow_up],
-        "decision": "continue",
-        "current_step": "execute_tools"
-    }
-
-
-# Pretty print the trace
-from IPython.display import Markdown, display
-import html
-
-def pretty_trace(result):
-    md = "## Fraud-Detection Trace\n\n"
-    for m in result["messages"]:
-        if m.type == "human":
-            md += f"**👤 User prompt**: *{html.escape(m.content.splitlines()[0])}*\n\n"
-        elif m.type == "ai":
-            if m.tool_calls:
-                for tc in m.tool_calls:
-                    md += f"**🤖 LLM decided** to call tool: `{tc['name']}` with args:\n"
-                    md += f"```json\n{json.dumps(tc['args'], indent=2)}\n```\n\n"
-            else:
-                md += f"**🤖 LLM final decision**: `{html.escape(m.content)}`\n\n"
-        elif m.type == "tool":
-            md += f"**🔧 Tool result** (`{m.name}`):\n"
-            md += f"```json\n{html.escape(m.content)}\n```\n\n"
-    display(Markdown(md))
-
-pretty_trace(result)
-
-
-# ------------------------------------------------------------------
-# Pretty-print the whole workflow run
-# ------------------------------------------------------------------
-from datetime import datetime
-import json
-
-def pretty_print_workflow(result: dict):
-    """
-    Nicely formatted report of the fraud-detection workflow.
-    """
-    print("# 🔍 Fraud-Detection Workflow Report")
-    print(f"**Generated:** {datetime.now():%Y-%m-%d %H:%M:%S}\n")
-
-    print("## 📄 Transaction Under Review")
-    print("```json")
-    print(json.dumps(result["transaction"], indent=2, ensure_ascii=False))
-    print("```\n")
-
-    print("## 🛠️ Step-by-Step Trace")
-    for idx, msg in enumerate(result["messages"], 1):
-        role = msg.type.upper()
-        content = msg.content.strip()
-
-        if role == "HUMAN":
-            # Show only the first line of the human prompt to keep it concise
-            headline = content.splitlines()[0] if content else "Prompt"
-            print(f"### {idx}. 👤 *{role}*: {headline}")
-        elif role == "AI":
-            print(f"### {idx}. 🤖 *{role}*")
-            if "Final Decision:" in content:
-                print("> ✅ **FINAL DECISION REACHED**")
-            else:
-                print("> 🔄 **DECISION: continue gathering data**")
-            print()
-            print("```")
-            print(content)
-            print("```")
-        elif role == "TOOL":
-            # Extract which tool was executed
-            # (LangChain’s ToolMessage has .name attribute in newer versions,
-            #  fallback if not available)
-            tool_name = getattr(msg, "name", "unknown_tool")
-            print(f"### {idx}. 🔧 *Tool Executed*: `{tool_name}`")
-            print("```json")
-            print(json.dumps(msg.content, indent=2, ensure_ascii=False))
-            print("```")
-
-    print("\n## 📊 Context Summary")
-    for key, value in result["context"].items():
-        if key != "processed_data":
-            print(f"- **{key}**:")
-            print("  ```json")
-            print(json.dumps(value, indent=2, ensure_ascii=False))
-            print("  ```")
-
-    print("\n## 🏁 Final Verdict")
-    print(f"> **{result['final_verdict'].upper()}**")
-
-# --- Run the pretty printer ---
-pretty_print_workflow(result)
+# Build graph
+workflow = StateGraph(AgentState)
+workflow.add_node("agent", call_model)
+workflow.add_node("tools", call_tools)
+# ... add edges
