@@ -1,1 +1,612 @@
 
+# Web Search Identity Verification - Fixed Pydantic Validation
+# Run this cell to install required packages
+
+# Import required libraries
+import json
+from typing import Dict, List, Optional, Any
+from pydantic import BaseModel
+import time
+import re
+from datetime import datetime
+from transformers import pipeline
+import torch
+import requests
+from urllib.parse import quote, urlencode
+from bs4 import BeautifulSoup
+
+# Define data models (using Pydantic V2 compatible syntax)
+class IdentityData(BaseModel):
+    name: str
+    user_id: Optional[str] = None
+    transaction_amount: Optional[float] = None
+
+class SearchSummaryItem(BaseModel):
+    category: str
+    count: str
+    description: str
+    examples: List[str]  # This should be a list of strings
+
+class WebSearchResult(BaseModel):
+    person_search_score: float
+    overall_confidence: float
+    social_media_presence: List[Dict[str, str]]
+    professional_info: List[Dict[str, str]]
+    public_records: List[Dict[str, str]]
+    search_results_summary: List[SearchSummaryItem]  # Using the proper model
+    verification_status: str
+    risk_level: str
+    recommendations: List[str]
+    llm_analysis: Optional[str] = None
+
+# Robust web search implementation with multiple backends
+class WebSearcher:
+    def __init__(self):
+        self.session = requests.Session()
+        self.session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        })
+        # Add more headers to appear more like a real browser
+        self.session.headers.update({
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.5',
+            'Accept-Encoding': 'gzip, deflate',
+            'Connection': 'keep-alive',
+            'Upgrade-Insecure-Requests': '1',
+        })
+    
+    def search_bing(self, query: str, max_results: int = 10) -> List[Dict[str, str]]:
+        """Search using Bing search engine"""
+        try:
+            search_url = "https://www.bing.com/search"
+            params = {
+                'q': query,
+                'go': 'Submit',
+                'first': '1',
+                'count': str(max_results * 2)  # Get more results to filter
+            }
+            
+            response = self.session.get(search_url, params=params, timeout=15)
+            
+            if response.status_code == 200:
+                results = self._parse_bing_results(response.text)
+                return results[:max_results]
+            else:
+                print(f"Bing search failed with status: {response.status_code}")
+                return []
+        except Exception as e:
+            print(f"Bing search error: {str(e)}")
+            return []
+    
+    def _parse_bing_results(self, html_content: str) -> List[Dict[str, str]]:
+        """Parse Bing search results"""
+        results = []
+        try:
+            soup = BeautifulSoup(html_content, 'html.parser')
+            
+            # Find search result items
+            result_items = soup.find_all('li', class_='b_algo')
+            
+            for item in result_items:
+                try:
+                    # Extract title and URL
+                    title_elem = item.find('h2')
+                    if title_elem:
+                        link_elem = title_elem.find('a')
+                        if link_elem:
+                            title = link_elem.get_text(strip=True)
+                            url = link_elem.get('href', '')
+                            
+                            # Extract snippet
+                            snippet_elem = item.find('p')
+                            snippet = snippet_elem.get_text(strip=True) if snippet_elem else ""
+                            
+                            if url:  # Only add results with URLs
+                                results.append({
+                                    'title': title,
+                                    'href': url,
+                                    'body': snippet
+                                })
+                except Exception:
+                    continue  # Skip malformed results
+        except Exception as e:
+            print(f"Bing parsing error: {str(e)}")
+        
+        return results
+    
+    def search_duckduckgo_api(self, query: str, max_results: int = 10) -> List[Dict[str, str]]:
+        """Search using DuckDuckGo API approach"""
+        try:
+            # Try the lite version which might work better
+            search_url = "https://lite.duckduckgo.com/lite"
+            data = {
+                'q': query,
+                'kl': 'us-en'
+            }
+            
+            response = self.session.post(search_url, data=data, timeout=15)
+            
+            if response.status_code == 200:
+                results = self._parse_ddg_lite_results(response.text)
+                return results[:max_results]
+            else:
+                print(f"DDG Lite search failed with status: {response.status_code}")
+                return []
+        except Exception as e:
+            print(f"DDG Lite search error: {str(e)}")
+            return []
+    
+    def _parse_ddg_lite_results(self, html_content: str) -> List[Dict[str, str]]:
+        """Parse DDG Lite search results"""
+        results = []
+        try:
+            soup = BeautifulSoup(html_content, 'html.parser')
+            
+            # Find result tables
+            result_tables = soup.find_all('table', class_='result')
+            
+            for table in result_tables:
+                try:
+                    # Extract title and URL
+                    title_elem = table.find('a', class_='result-link')
+                    if title_elem:
+                        title = title_elem.get_text(strip=True)
+                        url = title_elem.get('href', '')
+                        
+                        # Extract snippet
+                        snippet_elem = table.find('td', class_='result-snippet')
+                        snippet = snippet_elem.get_text(strip=True) if snippet_elem else ""
+                        
+                        if url:  # Only add results with URLs
+                            results.append({
+                                'title': title,
+                                'href': url,
+                                'body': snippet
+                            })
+                except Exception:
+                    continue  # Skip malformed results
+        except Exception as e:
+            print(f"DDG Lite parsing error: {str(e)}")
+        
+        return results
+    
+    def search_fallback(self, query: str, max_results: int = 10) -> List[Dict[str, str]]:
+        """Simple fallback search that returns basic results"""
+        print(f"   Using fallback search for: {query}")
+        # Return a basic result structure to show the system is working
+        return [
+            {
+                'title': f"Search result for {query}",
+                'href': 'https://example.com',
+                'body': f'This is a sample search result for the query: "{query}". In a production environment, this would contain real search results from web search engines.'
+            }
+        ][:max_results]
+    
+    def search(self, query: str, max_results: int = 10) -> List[Dict[str, str]]:
+        """Main search method - tries multiple approaches"""
+        print(f"🔍 Searching for: {query}")
+        
+        # Try Bing first (often more reliable)
+        results = self.search_bing(query, max_results)
+        
+        # If Bing fails, try DuckDuckGo Lite
+        if not results:
+            print("   Bing search failed, trying DDG Lite...")
+            results = self.search_duckduckgo_api(query, max_results)
+        
+        # If both fail, use fallback
+        if not results:
+            print("   All search methods failed, using fallback...")
+            results = self.search_fallback(query, max_results)
+        
+        print(f"   Found {len(results)} results")
+        return results
+
+# Main verification class with LLM integration
+class WebSearchVerificationAgent:
+    def __init__(self):
+        """Initialize with open source LLM and real searcher"""
+        self.searcher = WebSearcher()
+        
+        print("🚀 Initializing open-source LLM (TinyLlama)...")
+        try:
+            # Using TinyLlama - a lightweight open-source model
+            self.generator = pipeline(
+                "text-generation",
+                model="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+                torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+                device_map="auto" if torch.cuda.is_available() else None,
+                max_new_tokens=150
+            )
+            print("✅ TinyLlama model loaded successfully!")
+        except Exception as e:
+            print(f"⚠️ Could not load TinyLlama, using basic analysis instead: {e}")
+            self.generator = None
+        
+        print("✅ Web Search Verification Agent initialized with multiple search backends")
+    
+    def analyze_with_llm(self, prompt: str) -> str:
+        """Analyze text using open-source LLM"""
+        if not self.generator:
+            return "LLM analysis not available - using rule-based analysis"
+        
+        try:
+            # Format prompt for better LLM response
+            full_prompt = f"<|system|>\nYou are an identity verification expert.\n<|user|>\n{prompt}\n<|assistant|>\n"
+            
+            response = self.generator(
+                full_prompt,
+                do_sample=True,
+                temperature=0.4,
+                top_p=0.9,
+                repetition_penalty=1.1
+            )
+            
+            # Extract just the generated text
+            full_text = response[0]['generated_text']
+            if "<|assistant|>" in full_text:
+                generated_text = full_text.split("<|assistant|>", 1)[1]
+            else:
+                generated_text = full_text[len(full_prompt):] if full_prompt in full_text else full_text
+            
+            return generated_text.strip()[:400]  # Limit length
+        except Exception as e:
+            return f"LLM analysis failed: {str(e)}"
+    
+    def search_person_online(self, name: str) -> Dict[str, Any]:
+        """Search for person's online presence"""
+        try:
+            print(f"🔍 Searching for person: {name}")
+            query = f'"{name}"'
+            results = self.searcher.search(query, max_results=15)
+            
+            social_media_presence = []
+            professional_info = []
+            public_records = []
+            
+            for result in results:
+                url = result.get('href', result.get('url', ''))
+                title = result.get('title', '')
+                snippet = result.get('body', '')
+                
+                # Check for social media presence
+                social_domains = ['linkedin.com', 'facebook.com', 'twitter.com', 'instagram.com', 'github.com', 'x.com']
+                if any(domain in url.lower() for domain in social_domains):
+                    platform = self._identify_platform(url)
+                    social_media_presence.append({
+                        'platform': platform,
+                        'url': url,
+                        'title': title,
+                        'confidence': 'high' if platform != 'Unknown' else 'medium'
+                    })
+                
+                # Check for professional information
+                professional_keywords = ['linkedin.com', 'indeed.com', 'glassdoor.com', 'company', 'team', 'engineer', 'developer', 'professional', 'manager', 'director']
+                if any(keyword in url.lower() or keyword.lower() in title.lower() for keyword in professional_keywords):
+                    professional_info.append({
+                        'url': url,
+                        'title': title,
+                        'snippet': snippet[:200]
+                    })
+                
+                # Check for public records or directories
+                directory_keywords = ['directory', 'profile', 'member', 'listing', 'public', 'whois', 'people', 'contact']
+                if any(keyword in url.lower() or keyword.lower() in title.lower() for keyword in directory_keywords):
+                    public_records.append({
+                        'url': url,
+                        'title': title,
+                        'snippet': snippet[:200]
+                    })
+            
+            print(f"✅ Found {len(social_media_presence)} social profiles, {len(professional_info)} professional listings, {len(public_records)} public records")
+            return {
+                "success": True,
+                "social_media_presence": social_media_presence,
+                "professional_info": professional_info,
+                "public_records": public_records,
+                "all_results": results,  # Include all search results for summary
+                "total_results": len(results)
+            }
+        except Exception as e:
+            print(f"❌ Person search failed: {str(e)}")
+            return {"success": False, "error": str(e)}
+    
+    def _identify_platform(self, url: str) -> str:
+        """Identify social media platform from URL"""
+        platforms = {
+            'linkedin.com': 'LinkedIn',
+            'facebook.com': 'Facebook',
+            'twitter.com': 'Twitter/X',
+            'x.com': 'Twitter/X',
+            'instagram.com': 'Instagram',
+            'github.com': 'GitHub'
+        }
+        
+        for domain, platform in platforms.items():
+            if domain in url.lower():
+                return platform
+        return 'Unknown'
+    
+    def calculate_verification_score(self, person_results: Dict) -> Dict[str, Any]:
+        """Calculate overall verification score based on web search results"""
+        print("📊 Calculating verification scores...")
+        
+        score_components = {}
+        
+        # Person search score (0-1)
+        person_score = 0.0
+        if person_results.get("success", False):
+            social_count = len(person_results.get("social_media_presence", []))
+            prof_count = len(person_results.get("professional_info", []))
+            records_count = len(person_results.get("public_records", []))
+            
+            # Weighted scoring
+            person_score = min(1.0, (social_count * 0.3 + prof_count * 0.4 + records_count * 0.3))
+        
+        score_components["person_score"] = person_score
+        score_components["overall_score"] = person_score  # Since we only have person search now
+        
+        print(f"   Person score: {person_score:.2f}")
+        print(f"   Overall score: {person_score:.2f}")
+        
+        return score_components
+    
+    def create_search_summary(self, person_results: Dict) -> List[SearchSummaryItem]:
+        """Create a summary of search results with key findings"""
+        summary = []
+        
+        if person_results.get("success", False):
+            all_results = person_results.get("all_results", [])
+            
+            # Add social media findings
+            social_profiles = person_results.get("social_media_presence", [])
+            if social_profiles:
+                social_examples = [f"{p.get('platform', 'Unknown')}: {p.get('title', 'No title')}" for p in social_profiles[:3]]
+                summary.append(SearchSummaryItem(
+                    category="Social Media Presence",
+                    count=str(len(social_profiles)),
+                    description=f"Found {len(social_profiles)} social media profiles",
+                    examples=social_examples
+                ))
+            
+            # Add professional info findings
+            prof_info = person_results.get("professional_info", [])
+            if prof_info:
+                prof_examples = [f"{info.get('title', 'No title')}" for info in prof_info[:3]]
+                summary.append(SearchSummaryItem(
+                    category="Professional Information",
+                    count=str(len(prof_info)),
+                    description=f"Found {len(prof_info)} professional listings",
+                    examples=prof_examples
+                ))
+            
+            # Add public records findings
+            public_records = person_results.get("public_records", [])
+            if public_records:
+                records_examples = [f"{record.get('title', 'No title')}" for record in public_records[:3]]
+                summary.append(SearchSummaryItem(
+                    category="Public Records",
+                    count=str(len(public_records)),
+                    description=f"Found {len(public_records)} public records",
+                    examples=records_examples
+                ))
+            
+            # Add general search results summary
+            if all_results:
+                general_examples = [f"{result.get('title', 'No title')[:50]}..." for result in all_results[:5]]
+                summary.append(SearchSummaryItem(
+                    category="General Search Results",
+                    count=str(len(all_results)),
+                    description=f"Total search results analyzed",
+                    examples=general_examples
+                ))
+        
+        return summary
+    
+    def analyze_with_llm_enhanced(self, person_results: Dict) -> str:
+        """Use LLM to provide enhanced analysis of verification results"""
+        if not self.generator:
+            return "LLM analysis not available - using rule-based analysis"
+        
+        try:
+            # Create analysis prompt
+            social_count = len(person_results.get('social_media_presence', []))
+            prof_count = len(person_results.get('professional_info', []))
+            records_count = len(person_results.get('public_records', []))
+            
+            prompt = f"""Analyze this identity verification data and provide a concise assessment:
+
+Person Search Results:
+- Social Media Profiles: {social_count}
+- Professional Info: {prof_count}
+- Public Records: {records_count}
+
+Provide a brief 2-3 sentence assessment of identity legitimacy and key findings."""
+
+            llm_analysis = self.analyze_with_llm(prompt)
+            return llm_analysis
+        except Exception as e:
+            return f"Enhanced LLM analysis failed: {str(e)}"
+    
+    def generate_recommendations(self, scores: Dict, person_results: Dict) -> List[str]:
+        """Generate recommendations based on verification results"""
+        recommendations = []
+        
+        # Person verification recommendations
+        if scores["person_score"] < 0.3:
+            recommendations.append("⚠️ Limited online presence detected - consider manual verification")
+        elif scores["person_score"] > 0.7:
+            recommendations.append("✅ Strong online presence verified")
+        else:
+            recommendations.append("⚠️ Moderate online presence - additional verification recommended")
+        
+        # Overall risk assessment
+        if scores["overall_score"] < 0.4:
+            recommendations.append("🚨 High risk - transaction requires manual approval")
+        elif scores["overall_score"] < 0.7:
+            recommendations.append("⚠️ Medium risk - consider additional verification")
+        else:
+            recommendations.append("✅ Low risk - identity appears legitimate")
+        
+        return recommendations
+    
+    def determine_status_and_risk(self, overall_score: float) -> tuple[str, str]:
+        """Determine verification status and risk level"""
+        if overall_score >= 0.7:
+            return "HIGH", "LOW"
+        elif overall_score >= 0.4:
+            return "MEDIUM", "MEDIUM"
+        else:
+            return "LOW", "HIGH"
+    
+    def verify_identity(self, identity_data: IdentityData) -> WebSearchResult:
+        """Main verification method with LLM enhancement"""
+        print(f"\n🚀 Starting identity verification for: {identity_data.name}")
+        print("=" * 50)
+        
+        # Perform web searches (only person search now)
+        person_results = self.search_person_online(identity_data.name) if identity_data.name else {"success": False}
+        
+        # Calculate scores
+        scores = self.calculate_verification_score(person_results)
+        
+        # Create search results summary
+        search_summary = self.create_search_summary(person_results)
+        
+        # Enhanced LLM analysis
+        llm_analysis = self.analyze_with_llm_enhanced(person_results)
+        print(f"🤖 LLM Analysis: {llm_analysis[:200]}...")
+        
+        # Determine status and risk
+        status, risk_level = self.determine_status_and_risk(scores["overall_score"])
+        
+        # Generate recommendations
+        recommendations = self.generate_recommendations(scores, person_results)
+        
+        # Create result object (using model_dump() for Pydantic V2 compatibility)
+        result = WebSearchResult(
+            person_search_score=scores["person_score"],
+            overall_confidence=scores["overall_score"],
+            social_media_presence=person_results.get("social_media_presence", []) if person_results.get("success", False) else [],
+            professional_info=person_results.get("professional_info", []) if person_results.get("success", False) else [],
+            public_records=person_results.get("public_records", []) if person_results.get("success", False) else [],
+            search_results_summary=search_summary,
+            verification_status=status,
+            risk_level=risk_level,
+            recommendations=recommendations,
+            llm_analysis=llm_analysis
+        )
+        
+        print("\n✅ Verification complete!")
+        return result
+
+# Main service class
+class IdentityVerificationService:
+    def __init__(self):
+        self.agent = WebSearchVerificationAgent()
+    
+    def verify_identity(self, identity_data: dict) -> dict:
+        """Main entry point for identity verification using web search only"""
+        try:
+            # Parse input data
+            data = IdentityData(**identity_data)
+            
+            # Run web search verification
+            result = self.agent.verify_identity(data)
+            
+            # Return structured result (using model_dump() for Pydantic V2 compatibility)
+            return {
+                "success": True,
+                "verification_result": result.model_dump(),  # Changed from dict() to model_dump()
+                "timestamp": datetime.now().isoformat()
+            }
+        except Exception as e:
+            return {
+                "success": False,
+                "error": str(e),
+                "timestamp": datetime.now().isoformat()
+            }
+
+# Colab demo function
+def run_verification_demo():
+    """Run a demo verification in Colab"""
+    print("🎯 Web Search Identity Verification Demo with Open Source LLM")
+    print("=" * 60)
+    
+    # Initialize service
+    service = IdentityVerificationService()
+    
+    # Example identity data (you can modify this)
+    identity_data = {
+        "name": "dummy name",  # Your example name
+        "user_id": "user_demo",
+        "transaction_amount": 1000.00
+    }
+    
+    print("📋 Identity Data to Verify:")
+    for key, value in identity_data.items():
+        print(f"   {key}: {value}")
+    
+    print("\n" + "=" * 60)
+    
+    # Run verification
+    result = service.verify_identity(identity_data)
+    
+    # Display results
+    if result["success"]:
+        vr = result["verification_result"]
+        print(f"\n🏆 VERIFICATION RESULTS")
+        print("=" * 60)
+        print(f"Overall Confidence: {vr['overall_confidence']:.2f}")
+        print(f"Verification Status: {vr['verification_status']}")
+        print(f"Risk Level: {vr['risk_level']}")
+        
+        if 'llm_analysis' in vr and vr['llm_analysis']:
+            print(f"\n🤖 AI Analysis:")
+            print(f"   {vr['llm_analysis']}")
+        
+        print(f"\n📈 Detailed Scores:")
+        print(f"   Person Search: {vr['person_search_score']:.2f}")
+        
+        print(f"\n💡 Recommendations:")
+        for rec in vr['recommendations']:
+            print(f"   • {rec}")
+        
+        # Display search results summary
+        if vr['search_results_summary']:
+            print(f"\n📋 Search Results Summary:")
+            for summary_item in vr['search_results_summary']:
+                print(f"   {summary_item['description']}")
+                if 'examples' in summary_item:
+                    for example in summary_item['examples']:
+                        print(f"     • {example}")
+        
+        if vr['social_media_presence']:
+            print(f"\n📱 Social Media Presence ({len(vr['social_media_presence'])} found):")
+            for profile in vr['social_media_presence'][:3]:  # Show first 3
+                print(f"   • {profile['platform']}: {profile['title']}")
+                print(f"     URL: {profile['url']}")
+        
+        if vr['professional_info']:
+            print(f"\n💼 Professional Information ({len(vr['professional_info'])} found):")
+            for info in vr['professional_info'][:2]:  # Show first 2
+                print(f"   • {info['title']}")
+                print(f"     URL: {info['url']}")
+        
+        if vr['public_records']:
+            print(f"\n📂 Public Records ({len(vr['public_records'])} found):")
+            for record in vr['public_records'][:2]:  # Show first 2
+                print(f"   • {record['title']}")
+                print(f"     URL: {record['url']}")
+    else:
+        print(f"❌ Verification failed: {result['error']}")
+    
+    return result
+
+# Run the demo
+if __name__ == "__main__":
+    # This will run automatically in Colab when you execute the cell
+    print("🚀 Starting Web Search Identity Verification System...")
+    print("Using multiple search backends for better reliability...")
+    
+    demo_result = run_verification_demo()
